@@ -1,0 +1,1130 @@
+*******> spamtraj.patch
+
+Authors: Jason Swails and Guanglei Cui: GlaxoSmithKline
+
+Date: Aug. 2012
+
+Program: cpptraj
+
+Description: This patch adds support for the 'spamtraj' action, which is
+             necessary to carry out SPAM water map calculations. This can
+             be applied using patch_amber.py via the command:
+             $AMBERHOME/patch_amber.py --apply-patch spamtraj.patch
+
+-------------------------------------------------------------------------------
+
+ AmberTools/src/cpptraj/src/ActionList.cpp  |   2 +
+ AmberTools/src/cpptraj/src/Action_Spam.cpp | 927 +++++++++++++++++++++++++++++
+ AmberTools/src/cpptraj/src/Action_Spam.h   | 103 ++++
+ AmberTools/src/cpptraj/src/cpptrajdepend   |   4 +-
+ AmberTools/src/cpptraj/src/cpptrajfiles    |   6 +-
+ 5 files changed, 1038 insertions(+), 4 deletions(-)
+
+diff --git AmberTools/src/cpptraj/src/ActionList.cpp AmberTools/src/cpptraj/src/ActionList.cpp
+index f999e7f..359d2bc 100644
+--- AmberTools/src/cpptraj/src/ActionList.cpp
++++ AmberTools/src/cpptraj/src/ActionList.cpp
+@@ -33,6 +33,7 @@
+ #include "Action_Rotdif.h"
+ #include "Action_RunningAvg.h"
+ #include "Action_RmsAvgCorr.h"
++#include "Action_Spam.h"
+ #include "Action_AutoImage.h"
+ 
+ // CONSTRUCTOR
+@@ -102,6 +103,7 @@ int ActionList::AddAction(ArgList &argIn) {
+   else if (argIn.CommandIs("runningaverage")) {Act=new RunningAvg;}
+   else if (argIn.CommandIs("runavg"))         {Act=new RunningAvg;}
+   else if (argIn.CommandIs("rmsavgcorr"))     {Act=new RmsAvgCorr;}
++  else if (argIn.CommandIs("spamtraj"))       {Act=new Spam;}
+   else if (argIn.CommandIs("autoimage"))      {Act=new Action_AutoImage;}
+   // PTRAJ
+   else if (argIn.CommandIs("atomicfluct") ||
+diff --git AmberTools/src/cpptraj/src/Action_Spam.cpp AmberTools/src/cpptraj/src/Action_Spam.cpp
+new file mode 100644
+index 0000000..4653744
+--- /dev/null
++++ AmberTools/src/cpptraj/src/Action_Spam.cpp
+@@ -0,0 +1,926 @@
++#include <cmath> // ceil, exp
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include "Action_Spam.h"
++#include "Constants.h"
++#include "CpptrajStdio.h"
++#if 0
++#ifdef _OPENMP
++#   include "omp.h"
++#endif
++#endif
++#include "ProgressBar.h"
++#include "TrajectoryFile.h"
++
++// Macros to effectively sort 2 numbers
++#define MIN(X,Y) (((X)<(Y))? (X) : (Y))
++#define MAX(X,Y) (((X)>(Y))? (X) : (Y))
++
++// For sorting
++#define BIG_ 1e10f
++#define SMALL_ -1e10f
++
++// CONSTRUCTOR
++Spam::Spam() {
++  cutoff = 0.0f;
++  box_size = 0.0f;
++  resolution = 0.0f;
++  half_radii = 0.0f;
++  buffer_size = 0.0f;
++  sphere = false;
++  mass = false;
++  use_gridmask = true;
++  dx_file_name = NULL;
++  peak_file_name = NULL;
++  peak_input_name = NULL;
++  traj_name = NULL;
++  info_name = NULL;
++  center_str = NULL;
++}
++
++// Spam::init()
++/** Expected call: spamtraj [resolution <res>] [solvent_mask <solvent_mask>] 
++  *                     [solute_mask <solute_mask>] [out_dx <dx_file>]
++  *                     [mass] [sphere] [padding <padding>] [radius <O_radius>]
++  *                     [site_size <site_size>] [cutoff <cut>] 
++  *                     [peakout <peak_file>] [info <info_file>] 
++  *                     [out <traj_name>] [<traj_format>] [peakin <peak_file>]
++  *                     [center <x,y,z>] [xsize <xsize>] [ysize <ysize>]
++  *                     [zsize <zsize>]
++  *
++  * NOTE: If a peak input file is provided, that is used to reorder the
++  * trajectory file and all arguments dealing with grid creation/density
++  * calculation are ignored (as is peakout). Basically, if [peakin] is read,
++  * only 'sphere', 'site_size', 'info', 'out', and 'traj_format' are used
++  */
++
++int Spam::init() {
++  char *solv_mask_str, *solu_mask_str;
++
++  // Parse the commands (inserting default values)
++  sphere = actionArgs.hasKey("sphere");
++  mass = actionArgs.hasKey("mass");
++  
++  box_size = (float)actionArgs.getKeyDouble("site_size", 2.5);
++  resolution = (float)actionArgs.getKeyDouble("resolution", 0.5);
++  solv_mask_str = actionArgs.getKeyString("solvent_mask", (char*)":WAT@O=");
++  solu_mask_str = actionArgs.getKeyString("solute_mask", 
++                             (char*)"!(:WAT,Na+,Cl-,Mg+,Br-,Cs+,F-,I-,Rb+)");
++  dx_file_name = actionArgs.getKeyString("out_dx", NULL);
++  peak_file_name = actionArgs.getKeyString("peakout", (char*)"spam_peaks.xyz");
++  cutoff = (float)actionArgs.getKeyDouble("cutoff", 0.05);
++  buffer_size = (float)actionArgs.getKeyDouble("padding", 3);
++  half_radii = (float)actionArgs.getKeyDouble("radius", 1.3);
++  traj_name = actionArgs.getKeyString("out", NULL);
++  info_name = actionArgs.getKeyString("info", (char*)"spam.info");
++  peak_input_name = actionArgs.getKeyString("peakin", NULL);
++  center_str = actionArgs.getKeyString("center", NULL);
++  xsize = (float)actionArgs.getKeyDouble("xsize", 0);
++  ysize = (float)actionArgs.getKeyDouble("ysize", 0);
++  zsize = (float)actionArgs.getKeyDouble("zsize", 0);
++
++  // See if we want to use our grid mask to define our grid size or not
++  if (center_str != NULL)
++    use_gridmask = false;
++
++  // Our radius needs to be / 2
++  half_radii /= 2;
++
++  // Our box size needs to be / 2 since we look on either side of a grid point
++  box_size /= 2;
++
++  // Set up the masks
++  solvent.SetMaskString(solv_mask_str);
++  solute.SetMaskString(solu_mask_str);
++
++  return 0;
++}
++
++int Spam::setup() {
++
++  // Check our masks and make sure they select residues
++  if (currentParm->SetupIntegerMask(solvent, activeReference)) return 1;
++  if (currentParm->SetupIntegerMask(solute, activeReference)) return 1;
++
++  /* We only have to do anything after setting up the masks if we don't have a
++   * peak input file
++   */
++  if (peak_input_name != NULL) return 0;
++
++  // Set up the grid
++  grid.xmin = BIG_; grid.xmax = SMALL_; grid.gridsizex = 0;
++  grid.ymin = BIG_; grid.ymax = SMALL_; grid.gridsizey = 0;
++  grid.zmin = BIG_; grid.zmax = SMALL_; grid.gridsizez = 0;
++
++  if (solvent.None()) {
++    mprintf("Spam: Error: Solvent mask %s selects no atoms!\n", 
++            solvent.MaskString());
++    return 1;
++  }
++  if (!use_gridmask) {
++    // Test for bad grid sizes
++    if (xsize <= 0 || ysize <= 0 || zsize <= 0) {
++      mprintf(
++       "Spam: Error: User-defined grid must have xsize, ysize, and zsize > 0!");
++      return 1;
++    }
++    // Re-set buffer/padding to 0, since we defined our own grid
++    buffer_size = 0;
++
++    // center coordinates
++    float xc, yc, zc;
++    if (get_center_coords(center_str, &xc, &yc, &zc))
++      return 1;
++    grid.xmin = xc - xsize / 2; grid.xmax = xc + xsize / 2;
++    grid.ymin = yc - ysize / 2; grid.ymax = yc + ysize / 2;
++    grid.zmin = zc - zsize / 2; grid.zmax = zc + zsize / 2;
++
++ }else if (solute.None()) {
++    mprintf("Spam: Error: Solute mask %s selects no atoms!\n",
++            solute.MaskString());
++    return 1;
++  }
++  
++  return 0;
++}
++
++int Spam::action() {
++  // If we have a peak input, just store the frame for later
++  if (peak_input_name != NULL) {
++    Frame *frame_copy = currentFrame->FrameCopy();
++    if (RefCoord.AddFrame(frame_copy, currentParm)) return 1;
++    return 0;
++  }
++
++  // Otherwise, build the grid if it hasn't already been built
++  if (use_gridmask) {
++    for (std::vector<int>::iterator j = solute.Selected.begin(); 
++         j != solute.Selected.end(); j++) {
++      int j3 = *j * 3;
++      if ((float)currentFrame->X[j3  ] < grid.xmin) 
++        grid.xmin = (float)currentFrame->X[j3  ];
++  
++      if ((float)currentFrame->X[j3  ] > grid.xmax) 
++        grid.xmax = (float)currentFrame->X[j3  ];
++  
++      if ((float)currentFrame->X[j3+1] < grid.ymin) 
++        grid.ymin = (float)currentFrame->X[j3+1];
++  
++      if ((float)currentFrame->X[j3+1] > grid.ymax) 
++        grid.ymax = (float)currentFrame->X[j3+1];
++  
++      if ((float)currentFrame->X[j3+2] < grid.zmin) 
++        grid.zmin = (float)currentFrame->X[j3+2];
++  
++      if ((float)currentFrame->X[j3+2] > grid.zmax) 
++        grid.zmax = (float)currentFrame->X[j3+2];
++    }
++  }
++
++  // Just store this frame so we can act on it in "print"
++  Frame *frame_copy = currentFrame->FrameCopy();
++  if (RefCoord.AddFrame(frame_copy, currentParm)) return 1;
++  return 0;
++}
++
++// this actually performs the action
++void Spam::print() { 
++
++  // Set up the grid to calculate the density
++  if (peak_input_name == NULL && finish_grid()) {
++    mprintf("Spam: Error: Could not finish setting up grid\n");
++    return;
++  }
++  // Calculate the density
++  if (peak_input_name == NULL) {
++    density = calc_density();
++    if (!density.size()) {
++      mprintf("Spam: Error: could not calculate number density\n");
++      return;
++    }
++  }
++
++  // Write out the DX file if requested
++  if (peak_input_name == NULL && dx_file_name != NULL ) {
++    if (writeDX()) {
++      mprintf("Spam: Error: Could not write DX file [%s]\n", dx_file_name);
++      return;
++    }
++  }
++
++  if (peak_input_name == NULL) {
++    if (find_peaks()) {
++      mprintf("Spam: Error: Failed finding peaks!\n");
++      return;
++    }
++ }else {
++    peaks = load_peaks_from_file();
++    if (peaks.size() == 0) {
++      mprintf("Spam: Error: Failed reading peak file %s!\n", peak_input_name);
++      return;
++    }
++  }
++
++  // Fix the trajectory by swapping in the same water in every site
++  if (traj_name != NULL && fix_traj()) {
++    mprintf("Spam: Error: Failed adjusting trajectory!\n");
++    return;
++  }
++}
++
++// Spam::finish_grid()
++/** Adds the padding to the grid in each dimension (x, y, and z), figures out
++  * how many points are in each dimension, and tweaks the grid so an integral 
++  * number of grid points fits exactly inside the grid (and it is still centered
++  * at the same point)
++  */
++int Spam::finish_grid() {
++
++  // Add the padding
++  grid.xmin -= buffer_size;
++  grid.xmax += buffer_size;
++  grid.ymin -= buffer_size;
++  grid.ymax += buffer_size;
++  grid.zmin -= buffer_size;
++  grid.zmax += buffer_size;
++
++  // Determine how many grid points I should have
++  grid.gridsizex = (int) ceil((grid.xmax - grid.xmin) / resolution);
++  grid.gridsizey = (int) ceil((grid.ymax - grid.ymin) / resolution);
++  grid.gridsizez = (int) ceil((grid.zmax - grid.zmin) / resolution);
++
++  /* Since the grid spacing is not an even multiple of the resolution, we will
++   * find out how much extra room is used, and then adjust the min and max both
++   * by half that value so the solute remains centered in the box */
++
++  // X-coordinate now
++  float extra_space = (grid.xmin + resolution * grid.gridsizex) - grid.xmax;
++  grid.xmin -= extra_space / 2;
++  grid.xmax += extra_space / 2;
++  // Y-coordinate now
++  extra_space = (grid.ymin + resolution * grid.gridsizey) - grid.ymax;
++  grid.ymin -= extra_space / 2;
++  grid.ymax += extra_space / 2;
++  // Z-coordinate now
++  extra_space = (grid.zmin + resolution * grid.gridsizez) - grid.zmax;
++  grid.zmin -= extra_space / 2;
++  grid.zmax += extra_space / 2;
++
++  mprintf("Spam: Grid origin: (%g, %g, %g); dimensions: %d x %d x %d\n", 
++          grid.xmin, grid.ymin, grid.zmin, 
++          grid.gridsizex,grid.gridsizey, grid.gridsizez);
++
++  return 0;
++}
++
++// Spam::calc_density()
++/** Calculates the density of oxygen atoms at each point of the grid by 
++  * summing up normalized gaussian functions centered at each solvent atom
++  * (usually only Oxygen atoms are considered). The width of the gaussian
++  * function is the radius of the Oxygen, and the number density is averaged
++  * over every frame we analyze.
++  */
++std::vector<float> Spam::calc_density() {
++
++  // Set up a progress bar
++  mprintf("Spam: Calculating grid density of %s\n", solvent.MaskString());
++  ProgressBar *progress = new ProgressBar(RefCoord.NumFrames());
++  progress->Update(0);
++
++  // Define the normalization constant for each gaussian
++  float norm = 1 / (sqrt( 8.0 * PI*PI*PI ) * half_radii*half_radii*half_radii);
++
++  /* We end up having to divide every grid point by the total number of frames
++   * since we add onto the density for each frame. If we just include that in
++   * the normalization factor here, we don't have to divide through every point
++   * in the end
++   */
++  norm /= (float) RefCoord.NumFrames();
++
++  // Define the exponential factor for the gaussian
++  float expfac = -1.0 / (2.0 * half_radii*half_radii );
++
++  /* Define how many grid points we will search in each direction from the
++   * center of the molecule when we calculate the occupancy for efficiency's
++   * sake. The expression is taken to be consistent with VMD's VolMap tool
++   */
++  int nsteps = (int) ceil(4.1 * half_radii / resolution);
++
++  // Set up an interpolation grid
++//ExpLookup lookup_tbl;
++
++//std::vector<float> tbl_params(2);
++//tbl_params[0] = norm; tbl_params[1] = expfac;
++//lookup_tbl.setup(0.0f, nsteps*resolution+1.0f, 0.001, tbl_params);
++
++  /* Find out how many gridpoints we have, then resize our density to that
++   * size
++   */
++  int num_grdpts = grid.gridsizex * grid.gridsizey * grid.gridsizez;
++  std::vector<float> ret_density(num_grdpts);
++
++  /* The grid is layed out such that elements 0-(gridsizez-1) corresponds to 
++   * {xmin,ymin,zmin-zmax}, elements gridsizez-(2*gridsizez-1) corresponds to
++   * {xmin,ymin+1,zmin-zmax}, etc., and {xmin+N} is in the gridsizez*gridsizey*N
++   * range
++   */
++
++  // Define variables I will need in the loop
++  float gridx, gridy, gridz, dist2;
++
++  // Zero-out the density vector
++  for (int i = 0; i < ret_density.size(); i++) 
++    ret_density[i] = 0.0;
++
++  int i;
++#if 0
++#ifdef _OPENMP
++#pragma omp parallel shared(ret_density) private(i, gridx, gridy, gridz, dist2)
++{
++//mprintf("I have %d OpenMP threads\n", omp_get_num_threads());
++#pragma omp for
++#endif
++#endif
++  // Loop over every frame
++  for (i = 0; i < RefCoord.NumFrames(); i++) {
++    // Loop over every atom in our selected solvent mask
++    Frame *curFr = RefCoord.GetFrame(i);
++    int xval, yval, zval;
++    for (int j = 0; j < solvent.Selected.size(); j++) {
++      // Coordinate holder
++      double *x_ = new double[3];
++//    curFr->GetCoord(x_, solvent.Selected[j]);
++      x_[0] = curFr->X[3*solvent.Selected[j]  ];
++      x_[1] = curFr->X[3*solvent.Selected[j]+1];
++      x_[2] = curFr->X[3*solvent.Selected[j]+2];
++      /* Now we find the closest grid point to our oxygen, and then determine
++       * how many steps we will go +/- from that grid point in X,Y,Z, since 
++       * looping over every grid point is ridiculously expensive, and the 
++       * gaussian is only non-negligible on a small range. We pick the value
++       * to be consistent with VMD's VolMapCreateDensity routine.
++       *
++       * gx, gy, and gz are the x, y, and z coordinate of the closest grid pt.
++       * nsteps is the number of gridpoints on either side of gx,gy,gz to sample
++       */
++      int gx = find_grid_point(grid.xmin, (float)x_[0], resolution);
++      int gy = find_grid_point(grid.ymin, (float)x_[1], resolution);
++      int gz = find_grid_point(grid.zmin, (float)x_[2], resolution);
++
++      /* Skip the point if any of the coordinates are more than nsteps away 
++       * from either edge of the grid
++       */
++      bool skip_point = (gx < -nsteps || 
++                         gy < -nsteps || 
++                         gz < -nsteps || 
++                         gx>grid.gridsizex+nsteps || 
++                         gy>grid.gridsizey+nsteps || 
++                         gz>grid.gridsizez+nsteps);
++
++      // Only do this atom if it is within nsteps of the grid in any direction
++      if (!skip_point) {
++        for (xval=MAX(gx-nsteps,0); xval<MIN(gx+nsteps,grid.gridsizex); xval++)
++        for (yval=MAX(gy-nsteps,0); yval<MIN(gy+nsteps,grid.gridsizey); yval++)
++        for (zval=MAX(gz-nsteps,0); zval<MIN(gz+nsteps,grid.gridsizez); zval++) {
++          // Get the crds of the gridpoint
++          gridx = grid.xmin + xval * resolution;
++          gridy = grid.ymin + yval * resolution;
++          gridz = grid.zmin + zval * resolution;
++          // Get the distance squared w.r.t. the atom
++          dist2 = (gridx - (float)x_[0]) * (gridx - (float)x_[0]) 
++                + (gridy - (float)x_[1]) * (gridy - (float)x_[1])
++                + (gridz - (float)x_[2]) * (gridz - (float)x_[2]);
++          /* Now add the value of the gaussian at this point to the total density
++           * at that point
++           */
++          int grid_idx = xval * grid.gridsizey * grid.gridsizez
++                       + yval * grid.gridsizez 
++                       + zval;
++          ret_density[grid_idx] += norm * exp(expfac * dist2);
++//        ret_density[grid_idx] += lookup_tbl.lookup(dist2);
++        } // end loop over grid points
++      } // end if skip_point
++    } // end loop over atoms
++    progress->Update(i);
++  } // end loop over frames
++#if 0
++#ifdef _OPENMP
++}
++#endif
++#endif
++  delete progress;
++  return ret_density;
++}
++
++// Spam::find_grid_point()
++/** This function takes the actual coordinate (end) in 1 direction, the start of
++  * the grid in that direction (start), the distance between grid points (step),
++  * and the total number of points to find the point closest to (0.5 rounds up)
++  * A negative value is how many grid points away it is from the first, and a
++  * return value > the number of grid points is that many grid points away from
++  * the last one it is.
++  */
++int Spam::find_grid_point(float start, float end, float step) {
++  return (int) ( floor( (end - start) / step + 0.5 ) );
++}
++
++// Spam::writeDX()
++/** This function writes out a DX (IBM Data Explorer) file that is read in by
++  * VMD that stores the density.
++  * TODO: Add a DX IO Class for consistency.  Right now it's just hacked with 
++  *       streams
++  */
++int Spam::writeDX() {
++  // Open the File.  Hopefully I can replace this with a DX file class sometime
++  FILE *DX = fopen(dx_file_name, "w");
++  if (DX == NULL) {
++    mprintf("Spam: Error: Could not open %s for writing!\n", dx_file_name);
++    return 1;
++ }else {
++    mprintf("Spam: Writing density file %s\n", dx_file_name);
++  }
++
++  // Number of grid points
++  int num_grdpts = grid.gridsizex * grid.gridsizey * grid.gridsizez;
++  // origin is the average of the max/min of each coordinate
++
++  // Write the header
++  fprintf(DX, "object 1 class gridpositions counts %d %d %d\n", 
++          grid.gridsizex, grid.gridsizey, grid.gridsizez);
++  fprintf(DX, "origin %g %g %g\n", grid.xmin, grid.ymin, grid.zmin);
++  fprintf(DX, "delta %g 0 0\n", resolution);
++  fprintf(DX, "delta 0 %g 0\n", resolution);
++  fprintf(DX, "delta 0 0 %g\n", resolution);
++  fprintf(DX, "object 2 class gridconnections counts %d %d %d\n", 
++          grid.gridsizex, grid.gridsizey, grid.gridsizez);
++  fprintf(DX, "object 3 class array type double rank 0 items %d data follows\n",
++          num_grdpts);
++
++  // Now write the data  -- it's already in the form where z changes fastest
++  int i;
++  for (i = 0; i+2 < num_grdpts; i+=3) 
++    fprintf(DX, "%g %g %g\n", density[i], density[i+1], density[i+2]);
++
++  // There's a chance the above left out 1 or 2 points, so handle that case now
++  if (i+1 < num_grdpts)
++    fprintf(DX, "%g %g\n", density[i], density[i+1]);
++  else if (i < num_grdpts)
++    fprintf(DX, "%g\n", density[i]);
++  // else, no points were missed!
++
++  // Write the tail
++  fprintf(DX, "\nobject \"density (%s) [A^-3]\" class field\n", 
++            solvent.MaskString());
++  // Now we can close our file
++  fclose(DX);
++  return 0;
++}
++
++// Spam::find_peaks()
++/** Finds peaks using morphological techniques taken from multi-dimensional
++  * image processing. The original Python implementation used the scipy.ndimage
++  * package as shown below. Comments with ? relate directly to the Python 
++  * implementation
++  */
++/*? The steps we have to emulate here are:
++  ?
++  1    _nparray = numpy.select([self.dxgrid > bgcutoff], [self.dxgrid])
++  2    bg = (_nparray < bgcutoff)
++  3    nbr = ndimage.morphology.generate_binary_structure(len(_nparray.shape), 3)
++  4    lmax = (ndimage.filters.maximum_filter(_nparray, footprint=nbr)==_nparray)
++  5    ebg = ndimage.morphology.binary_erosion(bg, structure=nbr, border_value=1)
++  6    self.maxmask = lmax-ebg
++  7    self.dxgridmax = numpy.where(self.maxmask, _nparray, numpy.zeros(_nparray.shape))
++  ?*/
++int Spam::find_peaks() {
++
++  int num_grdpts = grid.gridsizex * grid.gridsizey * grid.gridsizez;
++
++  mprintf("Spam: Looking for particle density peaks above %g: ", cutoff);
++  std::vector<int> background(num_grdpts);
++  // Zero out all of the peaks that fall below the threshhold
++  for (int i = 0; i < num_grdpts; i++) {
++    background[i] = 0;
++    if (density[i] < cutoff) {
++      density[i] = 0.0f;
++      background[i] = 1;
++    }
++  }
++  //? This completes steps 1 and 2
++  //? Step 3 just says that each point is connected to all 26 grid points that 
++  //?  is 1 point away (including diagonals).
++  /* This applies a maximum filter assuming that each grid point is connected
++   * to all grid points adjacent or immediately diagonal to my grid point, and
++   * creates a vector containing a binary filter in which a point is given the
++   * value 1 if no adjacent grid point has a higher density
++   */
++  std::vector<int> density_filter(num_grdpts);
++//int reach = MAX(1, (int) ceil(box_size / resolution * 2));
++  int reach = 1;
++  for (int i = 0; i < num_grdpts; i++) {
++    std::vector<int> neibrs = neighbors(i, grid.gridsizex, 
++                                        grid.gridsizey, grid.gridsizez, reach);
++    float maxval = density[i];
++    for (std::vector<int>::iterator it = neibrs.begin(); 
++                                    it != neibrs.end(); it++) {
++      if (*it >= 0 && *it < num_grdpts)
++        if (density[*it] > maxval) 
++          maxval = density[*it];
++    } // for iterator it
++    if (maxval == density[i] && maxval > 0) 
++      density_filter[i] = 1;
++    else
++      density_filter[i] = 0;
++  } // for i = 0, num_grdpts
++  //? This completes step 4
++
++  /* Now it's time to erode the background. eroded_bg is an integer vector that
++   * stores 1 if each neighbor of background is 1 and 0 otherwise. Every point
++   * beyond the edges is taken to be 1.
++   */
++  std::vector<int> eroded_bg(num_grdpts);
++  for (int i = 0; i < num_grdpts; i++) {
++    std::vector<int> neibrs = neighbors(i, grid.gridsizex, grid.gridsizey,
++                                        grid.gridsizez, 1);
++    eroded_bg[i] = 1;
++    for (std::vector<int>::iterator it = neibrs.begin(); 
++         it != neibrs.end(); it++)
++      if (*it >= 0 && *it < num_grdpts && background[*it] == 0)
++        eroded_bg[i] = 0;
++  }
++  //? This completes step 5
++
++  /* Now we have to subtract the eroded background from the density filter.
++   * To avoid allocating another num_grdpts-size integer vector, just reuse
++   * background (since we're done with it)
++   */
++  for (int i = 0; i < num_grdpts; i++)
++    background[i] = density_filter[i] - eroded_bg[i];
++  //? This completes step 6
++
++  /* Finally, scan this background and when non-zero, take the value from
++   * density, otherwise set the value to 0.
++   */
++  for (int i = 0; i < num_grdpts; i++) {
++    if (background[i] != 0 && density[i] != 0) {
++      DensityPoint pt;
++      int tmp = i / (grid.gridsizey * grid.gridsizez);
++      pt.x = grid.xmin + resolution * tmp;
++      tmp = (i % (grid.gridsizey * grid.gridsizez)) / grid.gridsizez;
++      pt.y = grid.ymin + resolution * tmp;
++      tmp = i % grid.gridsizez;
++      pt.z = grid.zmin + resolution * tmp;
++      pt.density = density[i];
++      peaks.push_back(pt);
++    }
++  }
++  //? This completes step 7
++  // peaks now stores the grid points of all peaks
++  mprintf("Found %d peaks\n", peaks.size());
++
++  // Write out the file if requested
++  if (peak_file_name != NULL)
++    write_peak_file();
++
++  return 0;
++}
++
++// Spam::load_peaks_from_file()
++/** This loads peak locations from a file, thereby bypassing the grid creation
++  * part of spamtraj
++  */
++std::vector<Spam::DensityPoint> Spam::load_peaks_from_file() {
++   // Load a return value and an input file stream
++   std::vector<DensityPoint> return_val;
++   std::ifstream infile;
++   infile.open(peak_input_name);
++   if (! infile.good()) return return_val;
++   /* Now read the number of peaks. The format is very simple: The first line is
++    * the number of peaks, and each other line (except for a blank) is formatted
++    * C <xval> <yval> <zval> <density>
++    * so we can use a simple ifstream to pull out the values.
++    */
++   int npeaks;
++   infile >> npeaks;
++   for (int i = 0; i < npeaks; i++) {
++     if (infile.eof()) break;
++     std::string junk;
++     DensityPoint tmp;
++     infile >> junk >> tmp.x >> tmp.y >> tmp.z >> tmp.density;
++     // Translate the x, y, and z into a grid point
++     mprintf("SPAM: Found peak (%f, %f, %f) of density %f\n", 
++               tmp.x, tmp.y, tmp.z, tmp.density);
++     return_val.push_back(tmp);
++   }
++
++   return return_val;
++}
++
++// Spam::write_peak_file()
++/** This function writes a XYZ-format file with peak locations labeled as Carbon
++  * atoms so they can be visualized easily, with the final, "Charge" column 
++  * containing the particle density at that point.
++  */
++int Spam::write_peak_file() {
++
++  FILE *PK = fopen(peak_file_name, "w");
++  if (PK == NULL) {
++    mprintf("Spam: Error: Could not open %s for writing!\n", peak_file_name);
++    return 1;
++ }else {
++    mprintf("Spam: Writing peak location file %s\n", peak_file_name);
++  }
++
++  fprintf(PK, "%d\n\n", peaks.size());
++
++  for (std::vector<DensityPoint>::iterator it = peaks.begin(); 
++       it != peaks.end(); it++) {
++    fprintf(PK, "C %f %f %f %f\n", it->x, it->y, it->z, it->density);
++  }
++
++  fclose(PK);
++
++  return 0;
++}
++
++// Spam::fix_traj()
++/** This function adjusts each frame so that the same water molecule occupies
++  * each peak site in every frame.
++  */
++int Spam::fix_traj() {
++  /* The general strategy here will be to loop through each site and swap the
++   * water that is closest to each site into the same residue number for each
++   * frame.
++   */
++  mprintf("Spam: Fixing trajectory and outputting to %s\n", traj_name);
++  // Set up the trajectory
++  TrajectoryFile outtraj;
++  if (outtraj.SetupWrite(traj_name, &actionArgs, currentParm, AMBERTRAJ)) {
++    mprintf("Spam: Error: Could not set up trajectory %s for writing\n", 
++            traj_name);
++    return 1;
++  }
++
++  // Open the Info file
++  FILE *Info = fopen(info_name, "w");
++  if (Info == NULL) {
++    mprintf("Spam: Error: Could not open %s for writing.\n", info_name);
++    return 1;
++  }
++
++  // Set up an array of arrays to keep track of omitted points
++  typedef std::vector<int> numberlist;
++  std::vector< numberlist > omitted_points(peaks.size());
++
++  /* Set up function pointer based on whether we want our particle to be inside
++   * a sphere or if we want our particle to be inside a box.
++   */
++  float sidelength;
++  bool (*inside)(float, float, float, float, float, float, float);
++  if (sphere) {
++    sidelength = box_size * box_size;
++    inside = &inside_sphere;
++ }else {
++    sidelength = box_size;
++    inside = &inside_square;
++  }
++  // Write out some information about the trajectory
++  mprintf("Spam: "); outtraj.PrintInfo(1);
++
++  // Define some variables out here
++  const float RADIUS2 = half_radii * half_radii;
++  Frame *curFr;
++  std::vector<float> distances(peaks.size());
++  ProgressBar *progress = new ProgressBar(RefCoord.NumFrames());
++  progress->Update(0);
++
++  // First loop through all of the frames
++  for (int fr = 0; fr < RefCoord.NumFrames(); fr++) {
++    curFr = RefCoord.GetFrame(fr);
++    /* Now loop through every peak and keep track of how many solvent molecules
++     * are "inside" the defined area around each peak so we can filter out the
++     * frame/site combo we want to omit. We only include sites with 1 and only 1
++     * water. If it has 0 waters, the omitted frame number is > 0, if it has
++     * more than 1 water, the omitted frame number is < 0.  There is also the
++     * case that one water belongs to 2+ sites if the sites are close enough. In
++     * this case, we keep a log of which sites are 'occupied', and if the same
++     * water molecule satisfies 2 sites, it's used for the site whose center it
++     * is closest to, and the other one is then marked 'empty'.
++     */
++    std::vector<bool> occupied(peaks.size());
++    for (int i = 0; i < peaks.size(); i++) {
++      int num_waters = 0;
++      int water_id = 0;
++      // Now loop through every solvent atom
++      for (std::vector<int>::iterator it = solvent.Selected.begin();
++           it != solvent.Selected.end(); it++) {
++        if (inside(peaks[i].x, peaks[i].y, peaks[i].z, (float)curFr->X[3*(*it)  ], 
++                   (float)curFr->X[3*(*it)+1], (float)curFr->X[3*(*it)+2], 
++                   sidelength)) {
++          num_waters++;
++          water_id = *it;
++        }
++      }
++      /* Now see if we omit this frame or not. If not, swap the water into the
++       * proper position
++       */
++      if (num_waters == 1) {
++        /* Make sure if this water index is *before* the current index, that it
++         * does not belong to an occupied site. If it does, determine which site
++         * gets the water
++         */
++        if (water_id < solvent.Selected[i]) {
++          // Determine which site it may belong to
++          int j;
++          for (j = 0; j < i; j++)
++            if (solvent.Selected[j] == water_id) 
++              break;
++          if (occupied[j]) {
++            // Whoever is the _closer_ site gets the water
++            float d1 = (peaks[j].x - curFr->X[3*water_id  ]) *
++                       (peaks[j].x - curFr->X[3*water_id  ])
++                     + (peaks[j].y - curFr->X[3*water_id+1]) *
++                       (peaks[j].y - curFr->X[3*water_id+1])
++                     + (peaks[j].z - curFr->X[3*water_id+2]) *
++                       (peaks[j].z - curFr->X[3*water_id+2]);
++
++            float d2 = (peaks[j].x - curFr->X[3*water_id  ]) *
++                       (peaks[j].x - curFr->X[3*water_id  ])
++                     + (peaks[j].y - curFr->X[3*water_id+1]) *
++                       (peaks[j].y - curFr->X[3*water_id+1])
++                     + (peaks[j].z - curFr->X[3*water_id+2]) *
++                       (peaks[j].z - curFr->X[3*water_id+2]);
++
++            if (d2 < d1) {
++              swap(curFr, solvent.Selected[i], water_id);
++              occupied[i] = true;
++              occupied[j] = false;
++           }else {
++              occupied[i] = false;
++           } // if d2 < d1
++         }else {
++            swap(curFr, solvent.Selected[i], water_id);
++            occupied[i] = true;
++          } // if occupied[j]
++       }else {
++          swap(curFr, solvent.Selected[i], water_id);
++          occupied[i] = true;
++        } // if water_id < solvent.Selected[i]
++     }else if (num_waters == 0) {
++        omitted_points[i].push_back(fr);
++        occupied[i] = false;
++     }else {
++        omitted_points[i].push_back(-fr);
++        occupied[i] = false;
++      } // if num_waters == 1
++    } // for i < peaks
++    if(outtraj.WriteFrame(fr, currentParm, *curFr))
++      mprintf("Spam: Failed writing frame %d!\n", fr);
++    progress->Update(fr);
++  } // NumFrames()
++
++  // Now it's time to print out the omitted frames
++  fprintf(Info, "# There are %d density peaks and %d frames\n\n", 
++          peaks.size(), RefCoord.NumFrames());
++  for (int i = 0; i < omitted_points.size(); i++) {
++    if (omitted_points[i].size() > 0) {
++      // Find out how many are double-occupied
++      int ndouble = 0;
++      for (int j = 0; j < omitted_points[i].size(); j++) {
++        if (omitted_points[i][j] < 0) 
++          ndouble++;
++      }
++      fprintf(Info, "# Peak %d has %d omitted frames (%d double-occupied)\n", 
++              i, omitted_points[i].size(), ndouble);
++      for (int j = 0; j < omitted_points[i].size(); j++) {
++        if (j > 0 && j % 10 == 0) fprintf(Info, "\n");
++        fprintf(Info, "%7d ", omitted_points[i][j]);
++      }
++      fprintf(Info, "\n\n");
++    }
++  }
++  // Now close the info file
++  fclose(Info);
++  return 0;
++}
++
++// Spam::swap(Frame*, int, int)
++/** This routine swaps the atomic coordinates of 2 water molecules whose oxygen
++  * atom indexes are given by idx1 and idx2. This routine assumes that each
++  * water has 3 atoms, and that the oxygen is the first atom.
++  */
++void Spam::swap(Frame* curFr, int idx1, int idx2) {
++  // Loop over x,y,z of every atom of the water molecule and swap them
++  for (int i = 0; i < 9; i++) {
++    double holder = curFr->X[3*idx1+i];
++    curFr->X[3*idx1+i] = curFr->X[3*idx2+i];
++    curFr->X[3*idx2+i] = holder;
++  }
++}
++
++// Standalone functions
++
++// neighbors(int point, int sizex, int sizey, int sizez)
++/** This determines the grid point numbers that are neighbors of a given grid
++  * point and returns that list of 26 indices.  It CAN return grid indexes that
++  * don't exist (if the point is on one or more edges). Points are considered
++  * neighbors if their X/Y/Z grid points are within 'reach' away
++  */
++std::vector<int> neighbors(int point, int sizex, int sizey, 
++                           int sizez, int reach) {
++
++  // The XCoor, YCoor, ZCoor of the grid point (actually just the grid point #)
++  int xc = point / (sizey * sizez);
++  int yc = (point % (sizey * sizez)) / sizez;
++  int zc = point % sizez;
++  // List of neighbors to be returned
++  std::vector<int> neibrs;
++  
++  for (int i = -reach; i <= reach; i++)
++  for (int j = -reach; j <= reach; j++)
++  for (int k = -reach; k <= reach; k++) {
++    if (! (i == 0 && j == 0 && k == 0)) {
++      neibrs.push_back( (xc+i) * sizez * sizey + (yc+j) * sizez + (zc+k) );
++    }
++  }
++
++  return neibrs;
++}
++
++
++// inside_square(float, float, float, float, float, float, float)
++/** Returns true if we are inside a square whose side length is twice the
++  * passed halflen. We are passed the crds of a Grid point (p) and particle (p)
++  */
++bool inside_square(float xg, float yg, float zg, 
++                   float xp, float yp, float zp, float halflen) {
++  return (xg + halflen > xp && xg - halflen < xp &&
++          yg + halflen > yp && yg - halflen < yp &&
++          zg + halflen > zp && zg - halflen < zp);
++}
++
++// inside_square(float, float, float, float, float, float, float)
++/** Returns true if we are inside a sphere whose radius squared is given by
++  * rad2.  We are passed crds of a Grid point (g) and particle (p).
++  */
++bool inside_sphere(float xg, float yg, float zg,
++                   float xp, float yp, float zp, float rad2) {
++  return ( ((xg-xp) * (xg-xp) + (yg-yp) * (yg-yp) + (zg-zp) * (zg-zp)) < rad2 );
++}
++
++// get_center_coords(char*, float*, float*, float*)
++/** Sets the x,y,z coordinates from a given string with 3 comma-separated floats
++  */
++int get_center_coords(char* instring, float *xc, float *yc, float *zc) {
++
++   int str_size = strlen(instring);
++   // buffer to hold each comma-delimited string
++   std::vector<float> buf;
++   char tmp[str_size+1];
++   int idx = 0;
++   for (int i = 0; i < str_size; i++) {
++     // skip spaces
++     if (instring[i] == ' ') continue;
++     // See what to do based on what character we have
++     if (isdigit(instring[i]) || (instring[i] == '.')) {
++       tmp[idx++] = instring[i];
++    }else if (instring[i] == ',') {
++       tmp[idx] = '\0';
++       idx = 0;
++       std::istringstream iss((std::string) tmp);
++       float f;
++       if(!(iss >> f)) {
++         mprintf("Spam: Error: Detected non-float in center!\n");
++         return 1;
++       }
++       buf.push_back(f);
++    }else {
++       mprintf("Spam: Error: Bad character encountered in center!\n");
++       return 1;
++     }
++   }
++   mprintf("idx = %d\n", idx);
++   // Now handle the trailing characters
++   if (idx > 0) {
++      tmp[idx] = '\0';
++      std::istringstream iss((std::string) tmp);
++      float f;
++      if (!(iss >> f)) {
++         mprintf("Spam: Error: Detected non-float in center!\n");
++         return 1;
++      }
++      buf.push_back(f);
++   }
++   
++   if (buf.size() > 3) {
++     mprintf("Spam: Error: Too many coordinates encountered in center!\n");
++     return 1;
++  }else if (buf.size() < 3) {
++     mprintf("Spam: Error: Too few coordinates encountered in center!\n");
++     return 1;
++  }
++
++  *xc = buf[0]; *yc = buf[1]; *zc = buf[2];
++  return 0;
++}
+diff --git AmberTools/src/cpptraj/src/Action_Spam.h AmberTools/src/cpptraj/src/Action_Spam.h
+new file mode 100644
+index 0000000..1d632dd
+--- /dev/null
++++ AmberTools/src/cpptraj/src/Action_Spam.h
+@@ -0,0 +1,103 @@
++#ifndef INC_ACTION_SPAM_H
++#define INC_ACTION_SPAM_H
++#include <cstdio>
++#include <string>
++#include <vector>
++#include "FileRoutines.h"
++#include "FrameList.h"
++#include "AtomMask.h"
++#include "Action.h"
++
++// Class: Spam
++class Spam: public Action {
++  private:
++    // Member Data
++    float cutoff;       //< What is the smallest density that counts as a peak?
++    float box_size;     //< How big is the box that holds a solvent
++    float resolution;   //< Distance (Angstrom) between adjacent grid points
++    float half_radii;   //< Half the radius of the oxygen atoms
++    float buffer_size;  //< How much buffer to put around the edges for making 
++                        //  the volume map
++
++    // Grid setup variables
++    struct Grid {
++      float xmin;         //< Minimum in the X-coordinate
++      float xmax;         //< Maximum in the X-coordinate
++      int gridsizex;      //< Number of gridpoints in the X-direction
++      float ymin;         //< Minimum in the Y-coordinate
++      float ymax;         //< Maximum in the Y-coordinate
++      int gridsizey;      //< Number of gridpoints in the Y-direction
++      float zmin;         //< Minimum in the Z-coordinate
++      float zmax;         //< Maximum in the Z-coordinate
++      int gridsizez;      //< Number of gridpoints in the Z-direction
++    };
++
++    struct GridCenter {
++      float x;
++      float y;
++      float z;
++    };
++
++    // Grid point structure
++    struct DensityPoint {
++      float x;         //< X-coordinate of this point
++      float y;         //< Y-coordinate of this point
++      float z;         //< Z-coordinate of this point
++      float density;   //< Density at that point
++    };
++
++    bool sphere; //< Should the solvent-holding shape be a sphere?
++    bool mass;   //< Should we mass-weight the radii?
++
++    bool use_gridmask; //< Should we use gridmask, or user-provided grid specs?
++    float xsize; //< Size of the grid in the x-dimension if 'center' given
++    float ysize; //< Size of the grid in the y-dimension if 'center' given
++    float zsize; //< Size of the grid in the z-dimension if 'center' given
++    char *center_str; //< String to hold the center coordinates
++
++    AtomMask solute;  //< What we should consider as the solute
++    AtomMask solvent; //< What we should consider as the solvent
++
++    char *dx_file_name;    //< name of the file which dumps the density
++    char *peak_file_name;  //< name of the file which dumps the peak locations
++    char *peak_input_name; //< name of the file which has the peak locations
++    char *info_file;       //< name of the file with site occupancy information
++    char *traj_name;       //< name of the output trajectory
++    char *info_name;       //< name of the file with all water site info
++    
++    FrameList RefCoord; //< The stored snapshots so we can reprocess them
++
++    // Member Functions
++    void swap(Frame*, int, int); //< Swaps 2 atom numbers in currentFrame
++    int find_grid_point(float, float, float); //< find closest grid pt.
++    int finish_grid();   //< Sets up the grid
++    std::vector<float> calc_density();  //< Calculates the density
++    int writeDX();       //< Writes the DX file with the density
++    int write_peak_file(); //< Writes the XYZ file with the peak locations
++    int find_peaks();    //< Finds the peaks (where the water locations are)
++    std::vector<DensityPoint> load_peaks_from_file(); //< Reads peak locations
++    int fix_traj();      //< Adjust trajectory by swapping water molecules
++
++    Grid grid;                  //< The grid we will build our density on
++    std::vector<float> density; //< The density on the grid
++    std::vector<DensityPoint> peaks; //< Where the peaks are located
++
++  public:
++    Spam();
++//  ~Spam();
++
++    int init();      
++    int setup();        //< 
++    int action();       //< Here we will just store the coordinates
++    void print();       //< Now that we have crds stored, do action.
++};
++
++//v Determine the neighbor grid indices of a specific grid point
++std::vector<int> neighbors(int, int, int, int, int);
++//v Determine if an atom center is inside a square defined around a grid point
++bool inside_square(float, float, float, float, float, float, float);
++//v Determine if an atom center is inside a sphere defined around a grid point
++bool inside_sphere(float, float, float, float, float, float, float);
++//v Get coordinates from a comma-separated-list of floats
++int get_center_coords(char*, float*, float*, float*);
++#endif
+diff --git AmberTools/src/cpptraj/src/cpptrajdepend AmberTools/src/cpptraj/src/cpptrajdepend
+index 27016ab..9bd09ec 100644
+--- AmberTools/src/cpptraj/src/cpptrajdepend
++++ AmberTools/src/cpptraj/src/cpptrajdepend
+@@ -10,7 +10,7 @@ TrajinList.o : TrajinList.cpp AmberParm.h ArgList.h AtomMask.h Bonds.h BoxType.h
+ TrajoutList.o : TrajoutList.cpp AmberParm.h ArgList.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CoordFileList.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Frame.h Name.h ProgressBar.h Range.h TrajectoryFile.h TrajectoryIO.h TrajoutList.h
+ ReferenceList.o : ReferenceList.cpp AmberParm.h ArgList.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CoordFileList.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Frame.h FrameList.h Name.h ParmFileList.h ProgressBar.h Range.h ReferenceList.h TrajectoryFile.h TrajectoryIO.h
+ CoordFileList.o : CoordFileList.cpp AmberParm.h ArgList.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CoordFileList.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Frame.h Name.h ProgressBar.h Range.h TrajectoryFile.h TrajectoryIO.h
+-ActionList.o : ActionList.cpp Action.h ActionList.h Action_Angle.h Action_AtomMap.h Action_Average.h Action_Center.h Action_CheckStructure.h Action_Closest.h Action_Clustering.h Action_DSSP.h Action_Dihedral.h Action_DihedralScan.h Action_DistRmsd.h Action_Distance.h Action_Hbond.h Action_Image.h Action_Jcoupling.h Action_Mask.h Action_Molsurf.h Action_NAstruct.h Action_Outtraj.h Action_Pairwise.h Action_PtrajAction.h Action_Pucker.h Action_Radgyr.h Action_Radial.h Action_Rms2d.h Action_RmsAvgCorr.h Action_Rmsd.h Action_Rotdif.h Action_RunningAvg.h Action_Strip.h Action_Surf.h AmberParm.h ArgList.h AtomMask.h AxisType.h Bonds.h BoxType.h CharBuffer.h ClusterList.h CoordList.h CpptrajFile.h CpptrajStdio.h DataFile.h DataFileList.h DataSet.h DataSetList.h DataSet_double.h FileIO.h FileRoutines.h Frame.h FrameList.h Histogram.h Name.h ParmFileList.h ProgressBar.h Random.h Range.h TrajectoryFile.h TrajectoryIO.h TriangleMatrix.h molsurf.h ptraj_actions.h ptraj_arg.h ptraj_state.h
++ActionList.o : ActionList.cpp Action.h ActionList.h Action_Angle.h Action_AtomMap.h Action_AutoImage.h Action_Average.h Action_Center.h Action_CheckStructure.h Action_Closest.h Action_Clustering.h Action_DSSP.h Action_Dihedral.h Action_DihedralScan.h Action_DistRmsd.h Action_Distance.h Action_Hbond.h Action_Image.h Action_Jcoupling.h Action_Mask.h Action_Molsurf.h Action_NAstruct.h Action_Outtraj.h Action_Pairwise.h Action_PtrajAction.h Action_Pucker.h Action_Radgyr.h Action_Radial.h Action_Rms2d.h Action_RmsAvgCorr.h Action_Rmsd.h Action_Rotdif.h Action_RunningAvg.h Action_Spam.h Action_Strip.h Action_Surf.h AmberParm.h ArgList.h AtomMask.h AxisType.h Bonds.h BoxType.h CharBuffer.h ClusterList.h CoordList.h CpptrajFile.h CpptrajStdio.h DataFile.h DataFileList.h DataSet.h DataSetList.h DataSet_double.h FileIO.h FileRoutines.h Frame.h FrameList.h Histogram.h Name.h ParmFileList.h ProgressBar.h Random.h Range.h TrajectoryFile.h TrajectoryIO.h TriangleMatrix.h molsurf.h ptraj_actions.h ptraj_arg.h ptraj_state.h
+ DataSet.o : DataSet.cpp CharBuffer.h CpptrajStdio.h DataSet.h
+ DataSetList.o : DataSetList.cpp CharBuffer.h CpptrajStdio.h DataSet.h DataSetList.h DataSet_Matrix.h DataSet_XYZ.h DataSet_double.h DataSet_float.h DataSet_integer.h DataSet_string.h
+ vectormath.o : vectormath.cpp Constants.h CpptrajStdio.h vectormath.h
+@@ -114,3 +114,4 @@ Parm_Amber.o : Parm_Amber.cpp AmberParm.h AtomMask.h Bonds.h BoxType.h CharBuffe
+ Parm_PDB.o : Parm_PDB.cpp AmberParm.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Name.h PDBfileRoutines.h ParmIO.h Parm_PDB.h
+ Parm_Mol2.o : Parm_Mol2.cpp AmberParm.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Mol2FileRoutines.h Name.h ParmIO.h Parm_Mol2.h
+ Parm_CharmmPsf.o : Parm_CharmmPsf.cpp AmberParm.h AtomMask.h Bonds.h BoxType.h CharBuffer.h CpptrajFile.h CpptrajStdio.h FileIO.h FileRoutines.h Name.h ParmIO.h Parm_CharmmPsf.h
++Action_Spam.o : Action_Spam.cpp Action.h Action_Spam.h AmberParm.h ArgList.h AtomMask.h Bonds.h BoxType.h CharBuffer.h Constants.h CpptrajFile.h CpptrajStdio.h DataFile.h DataFileList.h DataSet.h DataSetList.h FileIO.h FileRoutines.h Frame.h FrameList.h Name.h ParmFileList.h ProgressBar.h Range.h TrajectoryFile.h TrajectoryIO.h
+diff --git AmberTools/src/cpptraj/src/cpptrajfiles AmberTools/src/cpptraj/src/cpptrajfiles
+index 9c05282..2fd8cfb 100644
+--- AmberTools/src/cpptraj/src/cpptrajfiles
++++ AmberTools/src/cpptraj/src/cpptrajfiles
+@@ -28,7 +28,7 @@ SOURCE=main.cpp AmberParm.cpp \
+        Action_CheckStructure.cpp Action_DihedralScan.cpp Action_Rotdif.cpp Random.cpp \
+        Integrate.cpp Analysis_Corr.cpp Action_RunningAvg.cpp Action_RmsAvgCorr.cpp \
+        DataSet_Matrix.cpp ParmFile.cpp Parm_Amber.cpp Parm_PDB.cpp Parm_Mol2.cpp \
+-       Parm_CharmmPsf.cpp
++       Parm_CharmmPsf.cpp Action_Spam.cpp
+ 
+ OBJECTS=main.o AmberParm.o \
+         Frame.o CpptrajState.o ArgList.o PtrajMask.o Action_Distance.o \
+@@ -60,7 +60,7 @@ OBJECTS=main.o AmberParm.o \
+         Action_CheckStructure.o Action_DihedralScan.o Action_Rotdif.o Random.o \
+         Integrate.o Analysis_Corr.o Action_RunningAvg.o Action_RmsAvgCorr.o \
+         DataSet_Matrix.o ParmFile.o Parm_Amber.o Parm_PDB.o Parm_Mol2.o \
+-        Parm_CharmmPsf.o
++        Parm_CharmmPsf.o Action_Spam.o
+ 
+ HEADERS=AmberParm.h \
+         Frame.h CpptrajState.h ArgList.h PtrajMask.h Action.h Action_Distance.h \
+@@ -92,5 +92,5 @@ HEADERS=AmberParm.h \
+         Action_CheckStructure.h Action_DihedralScan.h Action_Rotdif.h Random.h \
+         Integrate.h Analysis_Corr.h Action_RunningAvg.h Action_RmsAvgCorr.h \
+         DataSet_Matrix.h ParmFile.h ParmIO.h Parm_Amber.h Parm_PDB.h Parm_Mol2.h \
+-        Parm_CharmmPsf.h
++        Parm_CharmmPsf.h Action_Spam.h
+ 
